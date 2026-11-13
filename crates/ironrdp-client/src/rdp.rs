@@ -1136,6 +1136,20 @@ impl ResizeQueue {
         self.in_flight = None;
     }
 
+    /// Completes a resize that the graphics pipeline applied with `ResetGraphics`.
+    ///
+    /// An EGFX resize does not produce a Deactivation-Reactivation Sequence, so the resized
+    /// image is the only completion signal. The session loop calls this before dispatching
+    /// each iteration's outputs.
+    fn complete_if_image_matches(&mut self, image: &DecodedImage) {
+        if let Some(in_flight) = self.in_flight.as_ref()
+            && image.width() == in_flight.request.width
+            && image.height() == in_flight.request.height
+        {
+            self.completed();
+        }
+    }
+
     fn timed_out_request(&self, now: tokio::time::Instant) -> Option<(ResizeRequest, DisplayResizeFallbackReason)> {
         if let Some(in_flight) = self.in_flight.as_ref()
             && now >= in_flight.deadline
@@ -5405,6 +5419,7 @@ async fn active_session(
 
         let mut desktop_damage_regions = active_stage.take_damage_regions();
         let mut desktop_damage_delivered = false;
+        resize_queue.complete_if_image_matches(&image);
         for out in iteration.outputs {
             match out {
                 ActiveStageOutput::AutoReconnectCookie(cookie) => {
@@ -6651,6 +6666,21 @@ mod tests {
             })
             .disables_pnp()
         );
+    }
+
+    #[test]
+    fn resize_queue_completes_when_graphics_reset_reaches_requested_size() {
+        let request = resize_request(1600, 900);
+        let mut queue = ResizeQueue::default();
+        queue.mark_in_flight(request);
+
+        let wrong_size = DecodedImage::new(PixelFormat::RgbA32, 1600, 899);
+        queue.complete_if_image_matches(&wrong_size);
+        assert!(queue.in_flight.is_some());
+
+        let resized = DecodedImage::new(PixelFormat::RgbA32, 1600, 900);
+        queue.complete_if_image_matches(&resized);
+        assert!(queue.in_flight.is_none());
     }
 
     #[test]
