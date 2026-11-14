@@ -1253,6 +1253,17 @@ impl RdpClient {
         self
     }
 
+    /// Keeps retrying after a transport loss until the session is explicitly closed.
+    ///
+    /// Automatic reconnection still requires a server-issued reconnect cookie. The retry delay
+    /// backs off to a bounded maximum, so a long network outage does not cause a tight
+    /// connection-attempt loop.
+    #[must_use]
+    pub fn with_auto_reconnect_forever(mut self) -> Self {
+        self.auto_reconnect_maximum_attempts = Some(u32::MAX);
+        self
+    }
+
     /// Delivers tightly packed dirty regions ([`RdpOutputEvent::DesktopUpdate`]) instead of full
     /// [`RdpOutputEvent::Image`] snapshots.
     ///
@@ -1880,9 +1891,12 @@ impl RdpClient {
         // Keep bounded retries from exhausting their budget before a transient
         // network failure has had time to clear. A close during the wait is
         // handled by the connection loop before another connection attempt starts.
-        cancelable_operation(tokio::time::sleep(Duration::from_secs(1)), &mut self.close_receiver)
-            .await
-            .is_some()
+        cancelable_operation(
+            tokio::time::sleep(auto_reconnect_delay(attempt)),
+            &mut self.close_receiver,
+        )
+        .await
+        .is_some()
     }
 
     fn emit_user_initiated_termination(&self) {
@@ -1890,6 +1904,13 @@ impl RdpClient {
             .output_event_sender
             .try_send(RdpOutputEvent::Terminated(Ok(GracefulDisconnectReason::UserInitiated)));
     }
+}
+
+const AUTO_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(10);
+
+fn auto_reconnect_delay(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(4);
+    Duration::from_secs(1u64 << exponent).min(AUTO_RECONNECT_MAX_DELAY)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6878,6 +6899,16 @@ mod tests {
     #[test]
     fn zero_auto_reconnect_limit_disables_retries() {
         assert_eq!(AutoReconnectPolicy::new(0).next_attempt(0, true), None);
+    }
+
+    #[test]
+    fn auto_reconnect_delay_backs_off_and_stays_bounded() {
+        assert_eq!(auto_reconnect_delay(1), Duration::from_secs(1));
+        assert_eq!(auto_reconnect_delay(2), Duration::from_secs(2));
+        assert_eq!(auto_reconnect_delay(3), Duration::from_secs(4));
+        assert_eq!(auto_reconnect_delay(4), Duration::from_secs(8));
+        assert_eq!(auto_reconnect_delay(5), AUTO_RECONNECT_MAX_DELAY);
+        assert_eq!(auto_reconnect_delay(u32::MAX), AUTO_RECONNECT_MAX_DELAY);
     }
 
     #[test]
