@@ -220,6 +220,9 @@ pub enum RdpOutputEvent {
     PostLogonDisplayRedraw,
     /// A malformed bitmap update was discarded and a capability-gated full redraw was sent.
     MalformedBitmapDisplayRedraw,
+    /// A liveness probe could not be sent because the server does not support either of the
+    /// full-redraw recovery PDUs.
+    ProbeUnavailable,
     /// Dynamic Display Control could not update the session in place.
     ///
     /// The next connection attempt uses the requested desktop size.
@@ -488,7 +491,11 @@ impl ScreenCaptureHandler for ChannelEvents {
 /// Controls whether a pending automatic reconnect may proceed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AutoReconnectDecision {
+    /// Attempt after the client's normal bounded backoff.
     Continue,
+    /// Hold the failed session without attempting until an [`RdpInputEvent::ReconnectNow`]
+    /// arrives, or the session is closed.
+    Wait,
     Stop,
 }
 
@@ -638,6 +645,19 @@ pub enum RdpInputEvent {
     /// channel is unavailable.
     MonitorLayout(DisplayControlMonitorLayout),
     FastPath(SmallVec<[FastPathInputEvent; 2]>),
+    /// Requests a protocol-level liveness probe by forcing a full desktop redraw.
+    ///
+    /// The server response is an ordinary graphics update, so the embedder can wait for the
+    /// next [`RdpOutputEvent::Image`] or [`RdpOutputEvent::DesktopUpdate`] instead of sleeping
+    /// for a fixed interval. No response within the embedder's deadline means the session
+    /// should be reconnected.
+    Probe,
+    /// Ends the active session without a graceful shutdown so the client can immediately
+    /// auto-reconnect with its server-issued cookie.
+    ///
+    /// While the client is holding a failed session, this event releases the hold and starts
+    /// the next connection attempt.
+    ReconnectNow,
     /// Multitouch frames for MS-RDPEI (`Microsoft::Windows::RDS::Input`).
     Touch(TouchEventPdu),
     /// Pen frames for MS-RDPEI (`RDPINPUT_PEN_EVENT_PDU`).
@@ -1802,6 +1822,24 @@ impl RdpClient {
                     }
                     break;
                 }
+                Ok(RdpControlFlow::ReconnectRequested) => {
+                    if self
+                        .try_auto_reconnect(
+                            auto_reconnect_policy,
+                            &mut reconnect_attempt,
+                            auto_reconnect_cookie.as_ref(),
+                        )
+                        .await
+                    {
+                        continue;
+                    }
+                    let error =
+                        ironrdp_session::general_err!("reconnect requested but no auto-reconnect cookie is available");
+                    if !self.send_output_event(RdpOutputEvent::Terminated(Err(error))).await {
+                        self.emit_user_initiated_termination();
+                    }
+                    break;
+                }
                 Err(e) => {
                     if !self.send_output_event(RdpOutputEvent::Terminated(Err(e))).await {
                         self.emit_user_initiated_termination();
@@ -1884,19 +1922,39 @@ impl RdpClient {
             &mut self.close_receiver,
         )
         .await;
-        if !matches!(decision, Some(Ok(Ok(AutoReconnectDecision::Continue)))) {
-            return false;
+        match decision {
+            Some(Ok(Ok(AutoReconnectDecision::Continue))) => {
+                // Keep bounded retries from exhausting their budget before a transient
+                // network failure has had time to clear. A close during the wait is
+                // handled by the connection loop before another connection attempt starts.
+                cancelable_operation(
+                    tokio::time::sleep(auto_reconnect_delay(attempt)),
+                    &mut self.close_receiver,
+                )
+                .await
+                .is_some()
+            }
+            Some(Ok(Ok(AutoReconnectDecision::Wait))) => self.wait_for_reconnect_now().await,
+            Some(Ok(Ok(AutoReconnectDecision::Stop))) | Some(Ok(Err(_))) | Some(Err(_)) | None => false,
         }
+    }
 
-        // Keep bounded retries from exhausting their budget before a transient
-        // network failure has had time to clear. A close during the wait is
-        // handled by the connection loop before another connection attempt starts.
-        cancelable_operation(
-            tokio::time::sleep(auto_reconnect_delay(attempt)),
-            &mut self.close_receiver,
-        )
-        .await
-        .is_some()
+    /// Holds an interrupted session until the embedder asks for an attempt.
+    ///
+    /// Ordinary input is discarded while disconnected. This is intentional: the host should
+    /// use it as activity, then send [`RdpInputEvent::ReconnectNow`] rather than replaying a
+    /// stale click or key into a session that is not ready.
+    async fn wait_for_reconnect_now(&mut self) -> bool {
+        loop {
+            tokio::select! {
+                _ = self.close_receiver.changed() => return false,
+                event = self.input_event_receiver.recv() => match event {
+                    Some(RdpInputEvent::ReconnectNow) => return true,
+                    Some(RdpInputEvent::Close) | None => return false,
+                    Some(_) => {}
+                }
+            }
+        }
     }
 
     fn emit_user_initiated_termination(&self) {
@@ -4362,6 +4420,8 @@ enum RdpControlFlow {
         reason: DisplayResizeFallbackReason,
     },
     TransportFailure(SessionError),
+    /// The embedder asked for an immediate cookie-based reconnection.
+    ReconnectRequested,
     TerminatedGracefully(GracefulDisconnectReason),
     /// The server sent a Server Redirection PDU during the session.
     ServerRedirection(Box<ServerRedirectionPdu>),
@@ -5016,6 +5076,36 @@ async fn active_session(
                             None => ActiveSessionIteration::outputs(Vec::new()),
                         }
                     }
+                    RdpInputEvent::Probe => {
+                        let redraw_frames = active_stage.request_full_redraw(
+                            image.width(),
+                            image.height(),
+                            refresh_rect_support,
+                            suppress_output_support,
+                        )?;
+                        if redraw_frames.is_empty() {
+                            if !send_active_output_event(
+                                output_event_sender,
+                                RdpOutputEvent::ProbeUnavailable,
+                                close_receiver,
+                            )
+                            .await?
+                            {
+                                return Ok(RdpControlFlow::TerminatedGracefully(
+                                    GracefulDisconnectReason::UserInitiated,
+                                ));
+                            }
+                            ActiveSessionIteration::outputs(Vec::new())
+                        } else {
+                            ActiveSessionIteration::outputs(
+                                redraw_frames
+                                    .into_iter()
+                                    .map(ActiveStageOutput::ResponseFrame)
+                                    .collect(),
+                            )
+                        }
+                    }
+                    RdpInputEvent::ReconnectNow => return Ok(RdpControlFlow::ReconnectRequested),
                     RdpInputEvent::Touch(event) => {
                         trace!(frames = event.frames.len(), "RDPEI touch event");
                         match active_stage.prepare_rdpei_touch(event) {
