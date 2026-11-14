@@ -601,7 +601,9 @@ fn create_client_confirm_active(
     server_capability_sets.extend_from_slice(&[
         CapabilitySet::General(General {
             major_platform_type: config.platform,
-            extra_flags: GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED | GeneralExtraFlags::NO_BITMAP_COMPRESSION_HDR,
+            extra_flags: GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED
+                | GeneralExtraFlags::NO_BITMAP_COMPRESSION_HDR
+                | GeneralExtraFlags::AUTORECONNECT_SUPPORTED,
             ..Default::default()
         }),
         CapabilitySet::Bitmap(Bitmap {
