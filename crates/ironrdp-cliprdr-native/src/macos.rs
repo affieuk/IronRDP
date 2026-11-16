@@ -66,6 +66,10 @@ const REMOTE_FORMAT_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_FILE_CHUNK: u32 = 1024 * 1024;
 /// Largest text or image accepted from the remote clipboard.
 const MAX_TRANSFER_BYTES: usize = 100 * 1024 * 1024;
+/// Largest single remote file accepted into a lazy clipboard offer.
+const MAX_LAZY_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Largest combined advertised size accepted into one lazy clipboard offer.
+const MAX_LAZY_OFFER_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// Maximum number of entries in one local file list.
 const MAX_LOCAL_FILES: usize = 1000;
 /// How often byte progress is logged for a large file.
@@ -592,6 +596,7 @@ impl MacClipboard {
         let mut prepared = Vec::with_capacity(files.len());
         let mut roots = Vec::new();
         let mut missing_size = false;
+        let mut total_size = 0u64;
 
         for (wire_index, descriptor) in files.into_iter().enumerate() {
             let Some(path) = safe_remote_path(&root, &descriptor) else {
@@ -601,6 +606,17 @@ impl MacClipboard {
             if !is_directory(&descriptor) && descriptor.file_size.is_none() {
                 missing_size = true;
             }
+            if let Some(size) = descriptor.file_size {
+                if size > MAX_LAZY_FILE_BYTES {
+                    warn!(
+                        size,
+                        limit = MAX_LAZY_FILE_BYTES,
+                        "skipping lazy clipboard offer with an oversized file"
+                    );
+                    return;
+                }
+                total_size = total_size.saturating_add(size);
+            }
             let top_level = descriptor.relative_path.as_deref().is_none_or(|path| path.is_empty());
             if top_level {
                 roots.push(path.clone());
@@ -608,6 +624,14 @@ impl MacClipboard {
             prepared.push((wire_index, descriptor, path));
         }
 
+        if total_size > MAX_LAZY_OFFER_BYTES {
+            warn!(
+                total_size,
+                limit = MAX_LAZY_OFFER_BYTES,
+                "skipping lazy clipboard offer that exceeds the total size limit"
+            );
+            return;
+        }
         if missing_size {
             warn!("remote file list is missing a file size; lazy placeholders need sizes");
             let _ = fs::remove_dir_all(&root);

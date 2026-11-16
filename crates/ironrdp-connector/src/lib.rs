@@ -32,6 +32,7 @@ use ironrdp_pdu::rdp::client_info::{self, PerformanceFlags, TimezoneInfo};
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{PduHint, gcc, x224};
 pub use sspi;
+use zeroize::Zeroize;
 
 pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
 pub use self::connection::{
@@ -169,6 +170,15 @@ impl fmt::Debug for Credentials {
                 .field("pin", &"<redacted>")
                 .field("config", config)
                 .finish(),
+        }
+    }
+}
+
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        match self {
+            Self::UsernamePassword { password, .. } => password.zeroize(),
+            Self::SmartCard { pin, .. } => pin.zeroize(),
         }
     }
 }
