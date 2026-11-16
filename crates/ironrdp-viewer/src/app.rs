@@ -770,6 +770,9 @@ impl RpcApp {
                     "Reconnecting because dynamic display resize could not complete"
                 );
             }
+            RdpOutputEvent::ProbeUnavailable => {
+                warn!("Server does not support a full-redraw session probe");
+            }
             RdpOutputEvent::AutoReconnecting {
                 attempt,
                 maximum_attempts,
