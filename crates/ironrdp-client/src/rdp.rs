@@ -222,7 +222,9 @@ pub enum RdpOutputEvent {
     MalformedBitmapDisplayRedraw,
     /// A liveness probe could not be sent because the server does not support either of the
     /// full-redraw recovery PDUs.
-    ProbeUnavailable,
+    ///
+    /// `id` is the caller-supplied correlation ID from [`RdpInputEvent::Probe`].
+    ProbeUnavailable { id: u64 },
     /// Dynamic Display Control could not update the session in place.
     ///
     /// The next connection attempt uses the requested desktop size.
@@ -650,8 +652,9 @@ pub enum RdpInputEvent {
     /// The server response is an ordinary graphics update, so the embedder can wait for the
     /// next [`RdpOutputEvent::Image`] or [`RdpOutputEvent::DesktopUpdate`] instead of sleeping
     /// for a fixed interval. No response within the embedder's deadline means the session
-    /// should be reconnected.
-    Probe,
+    /// should be reconnected. `id` is echoed by
+    /// [`RdpOutputEvent::ProbeUnavailable`] so a late response can be matched to its request.
+    Probe { id: u64 },
     /// Ends the active session without a graceful shutdown so the client can immediately
     /// auto-reconnect with its server-issued cookie.
     ///
@@ -5076,7 +5079,7 @@ async fn active_session(
                             None => ActiveSessionIteration::outputs(Vec::new()),
                         }
                     }
-                    RdpInputEvent::Probe => {
+                    RdpInputEvent::Probe { id } => {
                         let redraw_frames = active_stage.request_full_redraw(
                             image.width(),
                             image.height(),
@@ -5086,7 +5089,7 @@ async fn active_session(
                         if redraw_frames.is_empty() {
                             if !send_active_output_event(
                                 output_event_sender,
-                                RdpOutputEvent::ProbeUnavailable,
+                                RdpOutputEvent::ProbeUnavailable { id },
                                 close_receiver,
                             )
                             .await?
